@@ -1,4 +1,3 @@
 alpaca-mcp-server
 fastapi
 uvicorn[standard]
-sse-starlette

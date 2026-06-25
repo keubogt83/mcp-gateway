@@ -6,8 +6,7 @@ from typing import AsyncGenerator
 
 import uvicorn
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse
-from sse_starlette.sse import EventSourceResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -18,7 +17,6 @@ logger = logging.getLogger(__name__)
 PORT = int(os.environ.get("PORT", "8000"))
 MCP_CMD = ["alpaca-mcp-server", "serve"]
 
-# Active sessions: session_id → subprocess
 sessions: dict[str, asyncio.subprocess.Process] = {}
 
 app = FastAPI(title="Alpaca MCP Gateway")
@@ -34,37 +32,45 @@ async def sse_endpoint(request: Request):
     session_id = str(uuid.uuid4())
     logger.info(f"Nueva conexión SSE | session={session_id}")
 
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *MCP_CMD,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        sessions[session_id] = process
-        logger.info(f"Proceso MCP iniciado | pid={process.pid} | session={session_id}")
-    except FileNotFoundError:
-        logger.error("alpaca-mcp-server no encontrado. Verifica la instalación.")
-        return JSONResponse({"error": "alpaca-mcp-server not installed"}, status_code=500)
-    except Exception as e:
-        logger.error(f"Error al iniciar proceso MCP: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+    async def event_stream() -> AsyncGenerator[str, None]:
+        # ── 1. Enviar el evento "endpoint" INMEDIATAMENTE ─────────────────
+        # El cliente necesita esto antes de poder enviar mensajes.
+        yield f"event: endpoint\ndata: /messages?sessionId={session_id}\n\n"
 
-    async def event_stream() -> AsyncGenerator:
+        # ── 2. Iniciar el subproceso MCP ──────────────────────────────────
+        process: asyncio.subprocess.Process | None = None
         try:
-            # MCP SSE protocol: notificar al cliente el endpoint donde debe hacer POST
-            yield {"event": "endpoint", "data": f"/messages?sessionId={session_id}"}
+            process = await asyncio.create_subprocess_exec(
+                *MCP_CMD,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            sessions[session_id] = process
+            logger.info(f"Proceso MCP iniciado | pid={process.pid} | session={session_id}")
+        except FileNotFoundError:
+            logger.error("alpaca-mcp-server no encontrado.")
+            yield "event: error\ndata: alpaca-mcp-server not installed\n\n"
+            return
+        except Exception as e:
+            logger.error(f"Error iniciando MCP: {e}")
+            yield f"event: error\ndata: {e}\n\n"
+            return
 
+        # ── 3. Stream stdout del MCP con keepalive cada 15s ───────────────
+        try:
             while True:
                 if await request.is_disconnected():
                     logger.info(f"Cliente desconectado | session={session_id}")
                     break
 
                 try:
-                    line = await asyncio.wait_for(process.stdout.readline(), timeout=25.0)
+                    line = await asyncio.wait_for(
+                        process.stdout.readline(), timeout=15.0
+                    )
                 except asyncio.TimeoutError:
-                    # Keepalive para que Railway no cierre la conexión idle
-                    yield {"event": "ping", "data": ""}
+                    # Comentario SSE — mantiene la conexión viva sin ser un mensaje
+                    yield ": ping\n\n"
                     continue
 
                 if not line:
@@ -73,21 +79,33 @@ async def sse_endpoint(request: Request):
 
                 decoded = line.decode().strip()
                 if decoded:
-                    logger.debug(f"MCP→cliente | {decoded[:120]}")
-                    yield {"event": "message", "data": decoded}
+                    logger.debug(f"MCP→cliente: {decoded[:120]}")
+                    yield f"data: {decoded}\n\n"
 
         except Exception as e:
             logger.error(f"Error en SSE stream | session={session_id} | {e}")
         finally:
-            try:
-                process.terminate()
-                await asyncio.wait_for(process.wait(), timeout=5.0)
-            except Exception:
-                process.kill()
+            if process is not None:
+                try:
+                    process.terminate()
+                    await asyncio.wait_for(process.wait(), timeout=5.0)
+                except Exception:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
             sessions.pop(session_id, None)
             logger.info(f"Sesión limpiada | session={session_id}")
 
-    return EventSourceResponse(event_stream())
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Desactiva buffering en nginx/Railway
+        },
+    )
 
 
 @app.post("/messages")
