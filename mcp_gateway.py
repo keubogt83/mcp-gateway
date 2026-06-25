@@ -106,6 +106,7 @@ async def sse_endpoint(request: Request):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=MCP_ENV,
+                limit=10 * 1024 * 1024,  # 10MB — evita LimitOverrunError en tools/list
             )
             sessions[sid] = process
             logger.info(f"   MCP pid={process.pid} arrancado")
