@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import uuid
@@ -15,8 +16,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 PORT = int(os.environ.get("PORT", "8000"))
-
-# PYTHONUNBUFFERED=1 fuerza a alpaca-mcp-server a escribir en stdout sin buffering
 MCP_ENV = {**os.environ, "PYTHONUNBUFFERED": "1"}
 MCP_CMD = ["alpaca-mcp-server", "serve"]
 
@@ -25,14 +24,63 @@ sessions: dict[str, asyncio.subprocess.Process] = {}
 app = FastAPI(title="Alpaca MCP Gateway")
 
 
-async def _log_stderr(process: asyncio.subprocess.Process, session_id: str) -> None:
-    """Lee stderr del subproceso y lo vuelca al log para debugging."""
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _log_msg(direction: str, sid: str, raw: str) -> None:
+    """Log completo de cada mensaje MCP en ambas direcciones."""
+    try:
+        parsed = json.loads(raw)
+        method = parsed.get("method", "")
+        msg_id = parsed.get("id", "-")
+        if "result" in parsed:
+            # Respuesta: mostrar las keys del result
+            result_keys = list(parsed["result"].keys()) if isinstance(parsed["result"], dict) else "scalar"
+            logger.info(f"{'─'*4} {direction} [{sid[:8]}] id={msg_id} RESULT keys={result_keys}")
+            logger.info(f"     FULL: {raw[:500]}")
+        elif "error" in parsed:
+            logger.error(f"{'─'*4} {direction} [{sid[:8]}] id={msg_id} ERROR: {parsed['error']}")
+        else:
+            logger.info(f"{'─'*4} {direction} [{sid[:8]}] id={msg_id} method={method!r}")
+            logger.info(f"     FULL: {raw[:500]}")
+    except json.JSONDecodeError:
+        logger.warning(f"{'─'*4} {direction} [{sid[:8]}] RAW (no JSON): {raw[:200]}")
+
+
+def _patch_initialize_response(raw: str, sid: str) -> str:
+    """
+    Si la respuesta del initialize no incluye 'tools' en capabilities,
+    lo inyectamos. Sin esto, Claude nunca envía tools/list.
+    """
+    try:
+        msg = json.loads(raw)
+        result = msg.get("result", {})
+        caps = result.get("capabilities")
+        if caps is None:
+            return raw  # No es una respuesta initialize
+
+        modified = False
+        if "tools" not in caps:
+            caps["tools"] = {}
+            modified = True
+            logger.info(f"[PATCH] [{sid[:8]}] Injected 'tools:{{}}' en capabilities")
+
+        if modified:
+            return json.dumps(msg)
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        pass
+    return raw
+
+
+async def _drain_stderr(process: asyncio.subprocess.Process, sid: str) -> None:
+    """Lee stderr del subprocess en background y lo vuelca al log."""
     while True:
         line = await process.stderr.readline()
         if not line:
             break
-        logger.warning(f"MCP stderr | session={session_id} | {line.decode().strip()}")
+        logger.warning(f"[STDERR] [{sid[:8]}] {line.decode().strip()}")
 
+
+# ── Endpoints ──────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
@@ -41,16 +89,17 @@ async def health():
 
 @app.get("/sse")
 async def sse_endpoint(request: Request):
-    session_id = str(uuid.uuid4())
-    logger.info(f"Nueva conexión SSE | session={session_id}")
+    sid = str(uuid.uuid4())
+    logger.info(f"══ Nueva conexión SSE | session={sid}")
+    logger.info(f"   ALPACA_API_KEY  : {'SET' if os.environ.get('ALPACA_API_KEY') else '*** MISSING ***'}")
+    logger.info(f"   ALPACA_SECRET_KEY: {'SET' if os.environ.get('ALPACA_SECRET_KEY') else '*** MISSING ***'}")
+    logger.info(f"   ALPACA_PAPER_TRADE: {os.environ.get('ALPACA_PAPER_TRADE', 'not set')}")
 
     async def event_stream() -> AsyncGenerator[str, None]:
         process: asyncio.subprocess.Process | None = None
 
         try:
-            # ── 1. Iniciar subproceso ANTES de enviar el endpoint ────────────
-            # Crítico: la sesión debe estar registrada antes de que Claude
-            # reciba la URL y haga el primer POST.
+            # ── 1. Arrancar subprocess y registrar sesión ──────────────────
             process = await asyncio.create_subprocess_exec(
                 *MCP_CMD,
                 stdin=asyncio.subprocess.PIPE,
@@ -58,19 +107,27 @@ async def sse_endpoint(request: Request):
                 stderr=asyncio.subprocess.PIPE,
                 env=MCP_ENV,
             )
-            sessions[session_id] = process
-            logger.info(f"MCP iniciado | pid={process.pid} | session={session_id}")
+            sessions[sid] = process
+            logger.info(f"   MCP pid={process.pid} arrancado")
 
-            # Leer stderr en background para diagnóstico
-            asyncio.create_task(_log_stderr(process, session_id))
+            # Dar 200ms para que el subprocess arranque y detectar crash inmediato
+            await asyncio.sleep(0.2)
+            if process.returncode is not None:
+                logger.error(f"   MCP MURIÓ en arranque | exit={process.returncode}")
+                yield f"event: error\ndata: MCP process crashed on startup (exit={process.returncode})\n\n"
+                return
 
-            # ── 2. Enviar evento "endpoint" con formato SSE exacto ───────────
-            yield f"event: endpoint\ndata: /messages?sessionId={session_id}\n\n"
+            # Drenar stderr en background
+            asyncio.create_task(_drain_stderr(process, sid))
 
-            # ── 3. Proxy stdout → SSE ────────────────────────────────────────
+            # ── 2. Enviar endpoint: sesión ya registrada, sin race condition ─
+            yield f"event: endpoint\ndata: /messages?sessionId={sid}\n\n"
+            logger.info(f"   Endpoint enviado a Claude → POST /messages?sessionId={sid}")
+
+            # ── 3. Proxy stdout → SSE (con intercepción de initialize) ──────
             while True:
                 if await request.is_disconnected():
-                    logger.info(f"Cliente desconectado | session={session_id}")
+                    logger.info(f"   Cliente desconectó [{sid[:8]}]")
                     break
 
                 try:
@@ -78,38 +135,40 @@ async def sse_endpoint(request: Request):
                         process.stdout.readline(), timeout=15.0
                     )
                 except asyncio.TimeoutError:
-                    # Comentario SSE: mantiene conexión viva, invisible para el cliente
                     yield ": ping\n\n"
                     continue
 
                 if not line:
-                    logger.info(f"MCP cerró stdout | session={session_id}")
+                    exit_code = process.returncode
+                    logger.error(f"   MCP cerró stdout [{sid[:8]}] | exit={exit_code}")
                     break
 
-                decoded = line.decode().strip()
-                if not decoded:
+                raw = line.decode().strip()
+                if not raw:
                     continue
 
-                logger.info(f"MCP→Claude | {decoded[:300]}")
-                yield f"data: {decoded}\n\n"
+                # Interceptar respuesta de initialize para garantizar tools en caps
+                patched = _patch_initialize_response(raw, sid)
+                _log_msg("MCP→Claude", sid, patched)
+                yield f"data: {patched}\n\n"
 
         except FileNotFoundError:
-            logger.error("alpaca-mcp-server no encontrado en PATH")
-            yield "event: error\ndata: alpaca-mcp-server not installed\n\n"
-        except Exception as e:
-            logger.error(f"Error en stream | session={session_id} | {e}")
+            logger.error(f"   alpaca-mcp-server no encontrado en PATH [{sid[:8]}]")
+            yield "event: error\ndata: alpaca-mcp-server not found in PATH\n\n"
+        except Exception as exc:
+            logger.error(f"   Error inesperado [{sid[:8]}]: {exc}", exc_info=True)
         finally:
-            sessions.pop(session_id, None)
+            sessions.pop(sid, None)
             if process is not None:
-                try:
-                    process.terminate()
-                    await asyncio.wait_for(process.wait(), timeout=5.0)
-                except Exception:
+                exit_code = process.returncode
+                if exit_code is None:
                     try:
-                        process.kill()
+                        process.terminate()
+                        await asyncio.wait_for(process.wait(), timeout=5.0)
+                        exit_code = process.returncode
                     except Exception:
-                        pass
-            logger.info(f"Sesión cerrada | session={session_id}")
+                        process.kill()
+                logger.info(f"══ Sesión cerrada [{sid[:8]}] | MCP exit={exit_code}")
 
     return StreamingResponse(
         event_stream(),
@@ -117,7 +176,7 @@ async def sse_endpoint(request: Request):
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",  # Desactiva buffering de nginx en Railway
+            "X-Accel-Buffering": "no",
         },
     )
 
@@ -130,21 +189,20 @@ async def messages_endpoint(request: Request, sessionId: str):
         return JSONResponse({"error": "Session not found"}, status_code=404)
 
     body = await request.body()
-    logger.info(f"Claude→MCP | session={sessionId} | {body.decode()[:300]}")
+    _log_msg("Claude→MCP", sessionId, body.decode())
 
     try:
-        # Proxy: escribir el mensaje JSON-RPC al stdin del subproceso
         process.stdin.write(body + b"\n")
         await process.stdin.drain()
         return Response(status_code=202)
     except BrokenPipeError:
-        logger.error(f"Pipe rota — MCP proceso muerto | session={sessionId}")
+        logger.error(f"Pipe rota — MCP muerto | session={sessionId[:8]}")
         sessions.pop(sessionId, None)
         return JSONResponse({"error": "MCP process died"}, status_code=500)
-    except Exception as e:
-        logger.error(f"Error escribiendo a MCP | session={sessionId} | {e}")
+    except Exception as exc:
+        logger.error(f"Error write stdin | session={sessionId[:8]} | {exc}")
         sessions.pop(sessionId, None)
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"error": str(exc)}, status_code=500)
 
 
 if __name__ == "__main__":
