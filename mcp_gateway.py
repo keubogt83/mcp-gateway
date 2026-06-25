@@ -15,11 +15,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 PORT = int(os.environ.get("PORT", "8000"))
+
+# PYTHONUNBUFFERED=1 fuerza a alpaca-mcp-server a escribir en stdout sin buffering
+MCP_ENV = {**os.environ, "PYTHONUNBUFFERED": "1"}
 MCP_CMD = ["alpaca-mcp-server", "serve"]
 
 sessions: dict[str, asyncio.subprocess.Process] = {}
 
 app = FastAPI(title="Alpaca MCP Gateway")
+
+
+async def _log_stderr(process: asyncio.subprocess.Process, session_id: str) -> None:
+    """Lee stderr del subproceso y lo vuelca al log para debugging."""
+    while True:
+        line = await process.stderr.readline()
+        if not line:
+            break
+        logger.warning(f"MCP stderr | session={session_id} | {line.decode().strip()}")
 
 
 @app.get("/health")
@@ -33,32 +45,29 @@ async def sse_endpoint(request: Request):
     logger.info(f"Nueva conexión SSE | session={session_id}")
 
     async def event_stream() -> AsyncGenerator[str, None]:
-        # ── 1. Enviar el evento "endpoint" INMEDIATAMENTE ─────────────────
-        # El cliente necesita esto antes de poder enviar mensajes.
-        yield f"event: endpoint\ndata: /messages?sessionId={session_id}\n\n"
-
-        # ── 2. Iniciar el subproceso MCP ──────────────────────────────────
         process: asyncio.subprocess.Process | None = None
+
         try:
+            # ── 1. Iniciar subproceso ANTES de enviar el endpoint ────────────
+            # Crítico: la sesión debe estar registrada antes de que Claude
+            # reciba la URL y haga el primer POST.
             process = await asyncio.create_subprocess_exec(
                 *MCP_CMD,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=MCP_ENV,
             )
             sessions[session_id] = process
-            logger.info(f"Proceso MCP iniciado | pid={process.pid} | session={session_id}")
-        except FileNotFoundError:
-            logger.error("alpaca-mcp-server no encontrado.")
-            yield "event: error\ndata: alpaca-mcp-server not installed\n\n"
-            return
-        except Exception as e:
-            logger.error(f"Error iniciando MCP: {e}")
-            yield f"event: error\ndata: {e}\n\n"
-            return
+            logger.info(f"MCP iniciado | pid={process.pid} | session={session_id}")
 
-        # ── 3. Stream stdout del MCP con keepalive cada 15s ───────────────
-        try:
+            # Leer stderr en background para diagnóstico
+            asyncio.create_task(_log_stderr(process, session_id))
+
+            # ── 2. Enviar evento "endpoint" con formato SSE exacto ───────────
+            yield f"event: endpoint\ndata: /messages?sessionId={session_id}\n\n"
+
+            # ── 3. Proxy stdout → SSE ────────────────────────────────────────
             while True:
                 if await request.is_disconnected():
                     logger.info(f"Cliente desconectado | session={session_id}")
@@ -69,22 +78,28 @@ async def sse_endpoint(request: Request):
                         process.stdout.readline(), timeout=15.0
                     )
                 except asyncio.TimeoutError:
-                    # Comentario SSE — mantiene la conexión viva sin ser un mensaje
+                    # Comentario SSE: mantiene conexión viva, invisible para el cliente
                     yield ": ping\n\n"
                     continue
 
                 if not line:
-                    logger.info(f"Proceso MCP cerró stdout | session={session_id}")
+                    logger.info(f"MCP cerró stdout | session={session_id}")
                     break
 
                 decoded = line.decode().strip()
-                if decoded:
-                    logger.debug(f"MCP→cliente: {decoded[:120]}")
-                    yield f"data: {decoded}\n\n"
+                if not decoded:
+                    continue
 
+                logger.info(f"MCP→Claude | {decoded[:300]}")
+                yield f"data: {decoded}\n\n"
+
+        except FileNotFoundError:
+            logger.error("alpaca-mcp-server no encontrado en PATH")
+            yield "event: error\ndata: alpaca-mcp-server not installed\n\n"
         except Exception as e:
-            logger.error(f"Error en SSE stream | session={session_id} | {e}")
+            logger.error(f"Error en stream | session={session_id} | {e}")
         finally:
+            sessions.pop(session_id, None)
             if process is not None:
                 try:
                     process.terminate()
@@ -94,8 +109,7 @@ async def sse_endpoint(request: Request):
                         process.kill()
                     except Exception:
                         pass
-            sessions.pop(session_id, None)
-            logger.info(f"Sesión limpiada | session={session_id}")
+            logger.info(f"Sesión cerrada | session={session_id}")
 
     return StreamingResponse(
         event_stream(),
@@ -103,7 +117,7 @@ async def sse_endpoint(request: Request):
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",  # Desactiva buffering en nginx/Railway
+            "X-Accel-Buffering": "no",  # Desactiva buffering de nginx en Railway
         },
     )
 
@@ -112,16 +126,21 @@ async def sse_endpoint(request: Request):
 async def messages_endpoint(request: Request, sessionId: str):
     process = sessions.get(sessionId)
     if not process:
-        logger.warning(f"Sesión no encontrada: {sessionId!r}")
+        logger.warning(f"POST a sesión inexistente: {sessionId!r}")
         return JSONResponse({"error": "Session not found"}, status_code=404)
 
     body = await request.body()
-    logger.debug(f"Cliente→MCP | session={sessionId} | {body[:120]}")
+    logger.info(f"Claude→MCP | session={sessionId} | {body.decode()[:300]}")
 
     try:
+        # Proxy: escribir el mensaje JSON-RPC al stdin del subproceso
         process.stdin.write(body + b"\n")
         await process.stdin.drain()
         return Response(status_code=202)
+    except BrokenPipeError:
+        logger.error(f"Pipe rota — MCP proceso muerto | session={sessionId}")
+        sessions.pop(sessionId, None)
+        return JSONResponse({"error": "MCP process died"}, status_code=500)
     except Exception as e:
         logger.error(f"Error escribiendo a MCP | session={sessionId} | {e}")
         sessions.pop(sessionId, None)
@@ -129,5 +148,5 @@ async def messages_endpoint(request: Request, sessionId: str):
 
 
 if __name__ == "__main__":
-    logger.info(f"Alpaca MCP Gateway arrancando en puerto {PORT}")
+    logger.info(f"Alpaca MCP Gateway en puerto {PORT}")
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
